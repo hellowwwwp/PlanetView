@@ -11,6 +11,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.animation.LinearInterpolator
 import android.widget.OverScroller
+import android.widget.Toast
 import androidx.annotation.ColorInt
 import androidx.core.math.MathUtils
 import androidx.core.view.ViewCompat
@@ -19,6 +20,7 @@ import com.blankj.utilcode.util.ImageUtils
 import com.blankj.utilcode.util.ScreenUtils
 import com.blankj.utilcode.util.SizeUtils
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
 
@@ -115,7 +117,7 @@ class PlanetView @JvmOverloads constructor(
 
     private var centerPositionUpdated: Boolean = false
     private var planetTrailsUpdated: Boolean = false
-    private var planetTrails: List<PlanetTrail>? = null
+    private val planetTrails: MutableList<PlanetTrail> = mutableListOf()
 
     var planetTrailPathMinRadius: Float = SizeUtils.dp2px(150f).toFloat()
         set(value) {
@@ -175,6 +177,15 @@ class PlanetView @JvmOverloads constructor(
     private var lastScrollX: Int = 0
     private var lastScrollY: Int = 0
 
+    //TODO 是否显示点击区域
+    private var showClickArea: Boolean = false
+
+    var clickAreaPadding: Float = SizeUtils.dp2px(4f).toFloat()
+        set(value) {
+            field = value
+            invalidateIfNeed()
+        }
+
     private val scroll: OverScroller = OverScroller(context)
 
     private val onGestureListener = object : GestureDetector.SimpleOnGestureListener() {
@@ -191,7 +202,16 @@ class PlanetView @JvmOverloads constructor(
             return super.onDown(event)
         }
 
+        override fun onSingleTapUp(event: MotionEvent): Boolean {
+            val satellite = findClickSatellite(event.x, event.y)
+            if (satellite != null) {
+                satellite.onClick?.invoke(satellite)
+            }
+            return true
+        }
+
         override fun onScroll(e1: MotionEvent, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
+            pause()
             rotatePlanetTrails(distanceX, distanceY)
             rotateSatellites(e2, distanceX, distanceY)
             invalidate()
@@ -254,7 +274,7 @@ class PlanetView @JvmOverloads constructor(
 
     private fun updatePlanetTrails() {
         planetTrailsUpdated = true
-        val list = mutableListOf<PlanetTrail>()
+        planetTrails.clear()
         repeat(planetTrailCount) {
             val radius = planetTrailPathMinRadius + ((it - 1) * planetTrailPathSpacing)
             val path = Path().apply {
@@ -262,7 +282,7 @@ class PlanetView @JvmOverloads constructor(
             }
             val direction = if (it % 2 == 0) Path.Direction.CW else Path.Direction.CCW
             val duration = 30 * 1000L + 5 * 1000L * it
-            val satellites = createSatellites(direction, duration)
+            val satellites = createSatellites(direction, duration, it)
             val planetTrail = PlanetTrail(
                 radius,
                 path,
@@ -270,12 +290,13 @@ class PlanetView @JvmOverloads constructor(
                 direction,
                 duration,
             )
-            list.add(planetTrail)
+            planetTrails.add(planetTrail)
         }
-        planetTrails = list
     }
 
-    private fun createSatellites(direction: Path.Direction, duration: Long): List<Satellite> {
+    private var lastToast: Toast? = null
+
+    private fun createSatellites(direction: Path.Direction, duration: Long, planetTrailIndex: Int): List<Satellite> {
         val satelliteCount = 2 + Random.nextInt(5)
         val list = mutableListOf<Satellite>()
         repeat(satelliteCount) {
@@ -284,18 +305,28 @@ class PlanetView @JvmOverloads constructor(
             val satellite = Satellite(
                 ColorUtils.getRandomColor(false),
                 radius,
-                "用户: $it",
+                "Satellite: $planetTrailIndex-$it",
                 position,
                 direction,
-                duration,
-            )
+                duration
+            ) { satellite ->
+                //TODO 点击监听 delete me
+                Log.e("tag", "onSatelliteClick: ${satellite.name}")
+                lastToast?.apply {
+                    cancel()
+                    lastToast = null
+                }
+                Toast.makeText(context, "onSatelliteClick: ${satellite.name}", Toast.LENGTH_SHORT).also {
+                    lastToast = it
+                }.show()
+            }
             list.add(satellite)
         }
         return list
     }
 
     private fun updateSatellites(delta: Float, direction: Path.Direction?) {
-        planetTrails?.forEach { planetTrail ->
+        planetTrails.forEach { planetTrail ->
             planetTrail.satellites?.forEach { satellite ->
                 val newPosition = satellite.calculateNewPosition(delta, direction)
                 satellite.position = newPosition
@@ -344,7 +375,7 @@ class PlanetView @JvmOverloads constructor(
         planetTrailPaint.style = Paint.Style.STROKE
         planetTrailPaint.color = planetTrailPathColor
         planetTrailPaint.strokeWidth = planetTrailPathWidth
-        planetTrails?.forEach { planetTrail ->
+        planetTrails.forEach { planetTrail ->
             val path = path.apply {
                 reset()
                 set(planetTrail.path)
@@ -358,8 +389,8 @@ class PlanetView @JvmOverloads constructor(
 
     private fun drawSatellites(canvas: Canvas, path: Path, satellites: List<Satellite>?) {
         satellitePaint.style = Paint.Style.FILL
-        val textHeight = textPaint.getHeight(fontMetrics)
-        val textBottom = textPaint.getBottom(fontMetrics)
+        val fontHeight = textPaint.getFontHeight(fontMetrics)
+        val fontBottom = textPaint.getFontBottom(fontMetrics)
         satellites?.forEach { satellite ->
             val scale = satellite.scale
             //绘制卫星点
@@ -369,17 +400,69 @@ class PlanetView @JvmOverloads constructor(
             pathMeasure.getPosTan(distance, pathMeasurePos, pathMeasureTan)
             val x = pathMeasurePos[0]
             val y = pathMeasurePos[1]
+            val satelliteLeft = x - satellite.radius * scale
+            val satelliteTop = y - satellite.radius * scale
+            val satelliteRight = x + satellite.radius * scale
+            val satelliteBottom = y + satellite.radius * scale
             canvas.drawCircle(x, y, satellite.radius * scale, satellitePaint)
             //绘制卫星名字
+            var textLeft = Float.MIN_VALUE
+            var textRight = Float.MIN_VALUE
+            var textBottom = Float.MIN_VALUE
             if (satellite.radius > Satellite.MIN_RADIUS * 2) {
                 satellitePaint.color = satelliteTextColor
                 satellitePaint.textSize = satelliteTextSize * scale
-                val textWidth = textPaint.measureText(satellite.name)
-                val textX = x - textWidth * scale * 0.5f
-                val textY = y + (satellite.radius * scale) + (textHeight * scale) - textBottom
+                val textWidth = satellitePaint.measureText(satellite.name)
+                val textX = x - textWidth * 0.5f
+                val textY = y + (satellite.radius * scale) + (fontHeight * scale) - fontBottom
+                textLeft = textX
+                textRight = x + textWidth * 0.5f
+                textBottom = textY + fontBottom
                 canvas.drawText(satellite.name, textX, textY, satellitePaint)
             }
+            //更新 satellite 的点击区域
+            val clickLeft: Float
+            val clickRight: Float
+            val clickBottom: Float
+            if (textLeft != Float.MIN_VALUE && textRight != Float.MIN_VALUE && textBottom != Float.MIN_VALUE) {
+                clickLeft = min(satelliteLeft, textLeft)
+                clickRight = max(satelliteRight, textRight)
+                clickBottom = textBottom
+            } else {
+                clickLeft = satelliteLeft
+                clickRight = satelliteRight
+                clickBottom = satelliteBottom
+            }
+            satellite.setClickArea(
+                clickLeft - clickAreaPadding,
+                satelliteTop - clickAreaPadding,
+                clickRight + clickAreaPadding,
+                clickBottom + clickAreaPadding
+            )
+
+            //TODO 绘制电机区域 delete me
+            if (showClickArea) {
+                satellitePaint.color = ColorUtils.setAlphaComponent(Color.WHITE, 0.1f)
+                canvas.drawRect(
+                    clickLeft - clickAreaPadding,
+                    satelliteTop - clickAreaPadding,
+                    clickRight + clickAreaPadding,
+                    clickBottom + clickAreaPadding,
+                    satellitePaint
+                )
+            }
         }
+    }
+
+    private fun findClickSatellite(x: Float, y: Float): Satellite? {
+        planetTrails.forEach { planetTrail ->
+            planetTrail.satellites?.forEach { satellite ->
+                if (satellite.isClickIn(x, y)) {
+                    return satellite
+                }
+            }
+        }
+        return null
     }
 
     private fun drawCenter(canvas: Canvas) {
@@ -406,9 +489,9 @@ class PlanetView @JvmOverloads constructor(
             } else {
                 //bitmap 和文字一起居中
                 textPaint.textSize = headerTextSize
-                val textHeight = textPaint.getHeight(fontMetrics)
+                val fontHeight = textPaint.getFontHeight(fontMetrics)
                 val x = centerX - bitmap.width * 0.5f
-                val y = centerY - (bitmap.height + textHeight) * 0.5f
+                val y = centerY - (bitmap.height + fontHeight) * 0.5f
                 headerImagePosition.set(x, y)
             }
         } else {
@@ -424,17 +507,17 @@ class PlanetView @JvmOverloads constructor(
         } else {
             textPaint.textSize = headerTextSize
             val textWidth = textPaint.measureText(text)
-            val textHeight = textPaint.getHeight(fontMetrics)
-            val bottom = textPaint.getBottom(fontMetrics)
+            val fontHeight = textPaint.getFontHeight(fontMetrics)
+            val fontBottom = textPaint.getFontBottom(fontMetrics)
             if (bitmap != null) {
                 //bitmap 和文字一起居中
                 val x = centerX - textWidth * 0.5f
-                val y = (centerY + (bitmap.height + textHeight) * 0.5f) - bottom
+                val y = (centerY + (bitmap.height + fontHeight) * 0.5f) - fontBottom
                 headerTextPosition.set(x, y + headerSpacing)
             } else {
                 //文字居中
                 val x = centerX - textWidth * 0.5f
-                val y = centerY + textHeight * 0.5f - bottom
+                val y = centerY + fontHeight * 0.5f - fontBottom
                 headerTextPosition.set(x, y)
             }
         }
@@ -444,7 +527,7 @@ class PlanetView @JvmOverloads constructor(
         gestureDetector.onTouchEvent(event)
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                pause()
+//                pause()
             }
             MotionEvent.ACTION_UP,
             MotionEvent.ACTION_CANCEL -> {
@@ -641,12 +724,12 @@ class PlanetView @JvmOverloads constructor(
         }
     }
 
-    private fun TextPaint.getHeight(metrics: Paint.FontMetrics): Float {
+    private fun TextPaint.getFontHeight(metrics: Paint.FontMetrics): Float {
         this.getFontMetrics(metrics)
         return metrics.bottom - metrics.top
     }
 
-    private fun TextPaint.getBottom(metrics: Paint.FontMetrics): Float {
+    private fun TextPaint.getFontBottom(metrics: Paint.FontMetrics): Float {
         this.getFontMetrics(metrics)
         return metrics.bottom
     }
@@ -685,7 +768,13 @@ class PlanetView @JvmOverloads constructor(
          * 转一圈的时长, 单位毫秒 ms
          */
         var duration: Long,
+        /**
+         * 点击事件
+         */
+        var onClick: ((Satellite) -> Unit)?,
     ) {
+        private val clickArea: RectF = RectF()
+
         val scale: Float
             get() {
                 return if (position > MIN_SCALE_POSITION && position <= MAX_SCALE_POSITION) {
@@ -724,6 +813,14 @@ class PlanetView @JvmOverloads constructor(
             }
         }
 
+        fun setClickArea(left: Float, top: Float, right: Float, bottom: Float) {
+            clickArea.set(left, top, right, bottom)
+        }
+
+        fun isClickIn(x: Float, y: Float): Boolean {
+            return clickArea.contains(x, y)
+        }
+
         companion object {
             val MIN_RADIUS: Int = SizeUtils.dp2px(2f)
             val MAX_RADIUS: Int = SizeUtils.dp2px(12f)
@@ -734,7 +831,7 @@ class PlanetView @JvmOverloads constructor(
             //最小缩放比例时的位置
             const val MIN_SCALE_POSITION = 0.3f
 
-            //最小缩放比例时的位置
+            //最大缩放比例时的位置
             const val MAX_SCALE_POSITION = 0.8f
         }
     }
